@@ -1,13 +1,17 @@
 import argparse
 import threading
 import time
-from collections import deque
+import csv
+import joblib
+from collections import deque, Counter
 import cv2
 import mediapipe as mp
 import numpy as np
-import simpleaudio as sa
+import winsound
 
 #utility files from the folder being used
+from utils import ear
+from utils import mar
 from utils.ear import LEFT_EYE_IDX, RIGHT_EYE_IDX, eye_aspect_ratio
 from utils.pose import head_pose_angles
 from utils.mar import mouth_aspect_ratio
@@ -28,14 +32,16 @@ def open_camera(index, width, height):
 #sound file
 def play_beep(wav_path):
     try:
-        wave_obj = sa.WaveObject.from_wave_file(wav_path)
-        wave_obj.play()
+        winsound.PlaySound(
+            wav_path,
+            winsound.SND_FILENAME | winsound.SND_ASYNC
+        )
     except Exception as e:
         print(f"[WARN] Failed to play sound: {e}")
 
 
 #display
-def draw_hud(frame, ear, mar, pitch, yaw, roll, status, cfg):
+def draw_hud(frame, ear, mar, pitch, yaw, roll, status, confidence, cfg):
     overlay = frame.copy()
     h, w = frame.shape[:2]
 
@@ -55,6 +61,15 @@ def draw_hud(frame, ear, mar, pitch, yaw, roll, status, cfg):
                 (20, 70), cv2.FONT_HERSHEY_DUPLEX, 0.7, color_text, 1)
     cv2.putText(frame, f"STATUS: {status.upper()}", (20, 110),
                 cv2.FONT_HERSHEY_DUPLEX, 0.9, color, 2)
+    cv2.putText(
+        frame,
+        f"CONFIDENCE: {confidence:.1f}%",
+        (20, 145),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.7,
+        (255,255,0),
+        2
+    )
 
     cv2.putText(frame, f"EAR<th:{cfg.ear_thresh:.2f}  MAR>th:{cfg.mar_thresh:.2f}",
                 (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_text, 1)
@@ -155,7 +170,7 @@ def auto_calibrate(face_mesh, cap, duration=15):
     yaws = np.array(yaws)
 
     ear_th = np.median(ears) * 0.85
-    mar_th = np.median(mars) * 1.5
+    mar_th = max(np.median(mars) * 2.0, 0.015)
     pitch_th = min(15.0, np.std(pitches) * 1.5 + 5.0)
     roll_th = min(20.0, np.std(rolls) * 1.5 + 8.0)
     yaw_th = min(25.0, np.std(yaws) * 1.5 + 10.0)
@@ -179,6 +194,11 @@ def main():
     if not cap:
         print("[ERR] Cannot open camera.")
         return
+    # Load trained ML model
+    model = joblib.load("model/drowsiness_model.pkl")
+    label_encoder = joblib.load("model/label_encoder.pkl")
+
+    print("[INFO] Machine Learning model loaded.")
 
     mp_face = mp.solutions.face_mesh
     face_mesh = mp_face.FaceMesh(refine_landmarks=True, max_num_faces=1)
@@ -187,6 +207,11 @@ def main():
     state = LiveState()
     last_beep = 0
     calibrated = False
+    current_label = "Alert"
+    prediction_history = deque(maxlen=15)
+    csv_file = open("dataset/drowsiness_dataset_new.csv", "a", newline="")
+    csv_writer = csv.writer(csv_file)
+
     face_missing_time = 0
 
     print("[INFO] Waiting for face...")
@@ -202,12 +227,21 @@ def main():
 
         if not res.multi_face_landmarks:
             face_missing_time += 1
+
             if face_missing_time > 30:
-                state.reset()
-                calibrated = False
-            cv2.putText(frame, "No face detected", (50, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(
+                    frame,
+                    "FACE NOT DETECTED",
+                    (40, 80),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    1,
+                    (0, 0, 255),
+                    2
+                )
+            # cv2.putText(frame, "No face detected", (50, 60),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv2.imshow("Drowsiness Detector", frame)
+
             if cv2.waitKey(1) & 0xFF == 27:
                 break
             continue
@@ -223,9 +257,23 @@ def main():
         if pitch is None:
             continue
 
-        if (ear < 0.01 and mar < 0.01):
-            state.reset()
-            calibrated = False
+        if ear < 0.01 and mar < 0.01:
+            cv2.putText(
+                frame,
+                "HEAD OUT OF FRAME",
+                (40, 80),
+                cv2.FONT_HERSHEY_DUPLEX,
+                1,
+                (0, 0, 255),
+                2
+            )
+
+            cv2.imshow("Drowsiness Detector", frame)
+
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+            continue
 
         if not calibrated:
             ear_th, mar_th, pitch_th, roll_th, yaw_th = auto_calibrate(face_mesh, cap, duration=15)
@@ -234,22 +282,46 @@ def main():
 
         state.push(t, ear, mar, pitch, roll, yaw)
         feats = state.get_means()
+        
 
-        if feats['mean_ear'] < ear_th or feats['mean_mar'] > mar_th:
-            pred = "drowsy"
-        elif (feats['mean_ear'] < ear_th * 1.1 or
-              abs(feats['mean_pitch']) > pitch_th or
-              abs(feats['mean_roll']) > roll_th or
-              abs(feats['mean_yaw']) > yaw_th):
-            pred = "slightly_drowsy"
-        else:
-            pred = "alert"
+        # Prepare feature vector for ML model
+        features = [[
+            ear,
+            mar,
+            pitch,
+            roll,
+            yaw
+        ]]
 
-        if pred == "drowsy" and not args.no_sound and time.time() - last_beep > 2:
+        # Predict using Random Forest
+        # Predict probabilities
+        probabilities = model.predict_proba(features)[0]
+
+        # Best class index
+        prediction = probabilities.argmax()
+
+        # Confidence
+        confidence = probabilities[prediction] * 100
+
+        # Convert to label
+        pred = label_encoder.inverse_transform([prediction])[0]
+
+        prediction_history.append(pred)
+
+        pred = Counter(prediction_history).most_common(1)[0][0]
+        status = pred.lower()
+        probs = model.predict_proba(features)[0]
+        confidence = max(probs) * 100
+
+        if status == "slightly_drowsy":
+            status = "slightly_drowsy"
+
+        if status  == "drowsy" and not args.no_sound and time.time() - last_beep > 2:
             threading.Thread(target=play_beep, args=(args.alarm,), daemon=True).start()
             last_beep = time.time()
 
-        draw_hud(frame, ear, mar, pitch, yaw, roll, pred,
+
+        draw_hud(frame, ear, mar, pitch, yaw, roll, status,confidence,
                  type("Cfg", (), dict(ear_thresh=ear_th, mar_thresh=mar_th,
                                       pitch_thresh=pitch_th, roll_thresh=roll_th,
                                       yaw_thresh=yaw_th)))
@@ -259,9 +331,34 @@ def main():
                         cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 200, 255), 2)
 
         cv2.imshow("Drowsiness Detector", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('a'):
+            current_label = "Alert"
+            print("[LABEL] Alert")
+
+        elif key == ord('s'):
+            current_label = "Slightly_Drowsy"
+            print("[LABEL] Slightly_Drowsy")
+
+        elif key == ord('d'):
+            current_label = "Drowsy"
+            print("[LABEL] Drowsy")
+
+        elif key == 27:
             break
 
+        csv_writer.writerow([
+            round(ear,4),
+            round(mar,4),
+            round(pitch,2),
+            round(roll,2),
+            round(yaw,2),
+            current_label
+        ])
+        # if cv2.waitKey(1) & 0xFF == 27:
+        #     break
+    csv_file.close()
     cap.release()
     cv2.destroyAllWindows()
 
